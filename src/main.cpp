@@ -1,262 +1,235 @@
-#include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-
+#include <Wire.h> // Bắt buộc phải có để sử dụng I2C
+#include <Adafruit_GFX.h> // Thư viện đồ họa Adafruit
+#include <Adafruit_SSD1306.h> // Thư viện cho màn hình SSD1306 OLED
 #include <ChronosESP32.h>
-#include <ESP32Time.h>
 
-// ===== OLED CONFIG =====
+// Khai báo màn hình OLED
+// Kích thước màn hình (pixels)
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
 
-#define SDA_PIN 21
-#define SCL_PIN 22
+// Địa chỉ I2C của màn hình OLED, THAY ĐỔI NẾU CỦA BẠN KHÁC (0x3C hoặc 0x3D)
+#define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#define OLED_SDA_PIN 21
+#define OLED_SCL_PIN 22
 
-// ===== CHRONOS CONFIG =====
-ChronosESP32 chronos("ESP32-NAV");
-ESP32Time rtc;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ===== UI STATE =====
-bool lastConnected = false;
+ChronosESP32 watch("ESP_NJG"); // set the bluetooth name
 
-Notification lastNotif;
-bool showingNotif = false;
-unsigned long notifShownAt = 0;
-const unsigned long NOTIF_SHOW_MS = 5000;
+bool change = false;
+uint32_t nav_crc = 0xFFFFFFFF;
 
-// ===== Helpers =====
-static void clearAndBase() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-}
+// Thêm biến toàn cục để lưu trữ dữ liệu navigation và trạng thái
+Navigation currentNavData;
+bool isNavigationActive = false; // Biến theo dõi trạng thái dẫn đường
 
-static void showStatus(const String &l1, const String &l2 = "") {
-  clearAndBase();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(l1);
-  if (l2.length()) display.println(l2);
-  display.display();
-}
 
-static void drawWrapped(const String &textIn, int x, int y, int w, int maxLines) {
-  String text = textIn;
-  text.trim();
-  int charsPerLine = max(1, w / 6); // ~6px per char at size 1
-  int line = 0;
-  int idx = 0;
+void connectionCallback(bool state)
+{
+    //Serial.print("Connection state: ");
+    //Serial.println(state ? "Connected" : "Disconnected");
 
-  while (idx < (int)text.length() && line < maxLines) {
-    int take = min(charsPerLine, (int)text.length() - idx);
-    int cut = idx + take;
-
-    if (cut < (int)text.length()) {
-      int lastSpace = text.lastIndexOf(' ', cut);
-      if (lastSpace > idx) cut = lastSpace;
-    }
-
-    display.setCursor(x, y + line * 10);
-    display.print(text.substring(idx, cut));
-
-    idx = cut;
-    while (idx < (int)text.length() && text[idx] == ' ') idx++;
-    line++;
-  }
-}
-
-static String trimShort(String s, int maxLen) {
-  s.trim();
-  if ((int)s.length() > maxLen) s = s.substring(0, maxLen);
-  return s;
-}
-
-static bool notifLooksValid(const Notification &n) {
-  return (n.app.length() || n.title.length() || n.message.length());
-}
-
-static void drawBigCenteredTime() {
-  // ambil jam dari ChronosESP32 (dia extends ESP32Time)
-  // pastikan chronos.loop() jalan biar time ke-update dari app
-  String hh = chronos.getHourZ();   // zero padded
-  int mm = chronos.getMinute();
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%s:%02d", hh.c_str(), mm);
-  String t = String(buf);
-
-  // maksimal buat OLED 128x64: textSize 3 masih muat pas-pasan
-  // size 4 kebanyakan, kecuali font custom (lo belum siap)
-  display.setTextSize(3);
-  int16_t x1, y1;
-  uint16_t w, h;
-  display.getTextBounds(t, 0, 0, &x1, &y1, &w, &h);
-
-  int x = (SCREEN_WIDTH - (int)w) / 2;
-  int y = 14; // biar tengah
-
-  display.setCursor(max(0, x), y);
-  display.print(t);
-}
-
-static void drawWeatherSmall() {
-  int wc = chronos.getWeatherCount();
-  if (wc <= 0) return;
-
-  Weather w = chronos.getWeatherAt(0);
-
-  display.setTextSize(1);
-  display.setCursor(0, 54);
-  display.print(w.temp);
-  display.print("C ");
-  display.print(w.high);
-  display.print("/");
-  display.print(w.low);
-
-  // kota kalau mau (tapi kepanjangan biasanya)
-  // display.setCursor(80, 54);
-  // display.print(trimShort(chronos.getWeatherCity(), 8));
-}
-
-static void drawIdleScreen() {
-  clearAndBase();
-
-  // kalau time belum keset, tampilkan “--:--”
-  // tapi kita tetap coba gambar jam
-  drawBigCenteredTime();
-  drawWeatherSmall();
-
-  display.display();
-}
-
-static void drawNotifScreen() {
-  clearAndBase();
-  display.setTextSize(1);
-
-  String app = trimShort(lastNotif.app, 20);
-  String title = trimShort(lastNotif.title, 26);
-  String msg = lastNotif.message;
-  msg.trim();
-
-  display.setCursor(0, 0);
-  display.println("NOTIF:");
-  display.println(app.length() ? app : "-");
-
-  display.setCursor(0, 22);
-  drawWrapped(title.length() ? title : "-", 0, 22, 128, 2);
-
-  display.setCursor(0, 44);
-  drawWrapped(msg.length() ? msg : "-", 0, 44, 128, 2);
-
-  display.display();
-}
-
-static void drawNavScreen(const Navigation &nav) {
-  clearAndBase();
-
-  // PANAH / ICON 48x48 dari Chronos
-  // Icon ini 1bpp, cocok buat SSD1306
-  if (nav.hasIcon) {
-    display.drawBitmap(
-      40,   // (128-48)/2 = 40 biar tengah
-      0,
-      nav.icon,
-      48,
-      48,
-      SSD1306_WHITE
-    );
-  } else {
-    // kalau belum ada icon, kasih teks biar ga kosong
+    // Cập nhật trạng thái kết nối lên OLED
+    display.clearDisplay();
     display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("NAV...");
-  }
-
-  // Info teks bawah
-  display.setTextSize(1);
-
-  // jarak/title biasanya “850 m” di title, atau jarak ke next step
-  String top = trimShort(nav.title, 20);
-  display.setCursor(0, 48);
-  display.print(top.length() ? top : "-");
-
-  String instr = nav.directions; instr.trim();
-  if (instr.length() == 0) instr = "Next";
-
-  // instruksi 1 baris aja (OLED kecil)
-  display.setCursor(0, 56);
-  display.print(trimShort(instr, 21));
-
-  display.display();
-}
-
-void setup() {
-  Serial.begin(115200);
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    while (true) delay(1000);
-  }
-
-  showStatus("ESP32 NAV", "Waiting Chronos...");
-  chronos.begin();
-}
-
-void loop() {
-  chronos.loop();
-
-  bool connected = chronos.isConnected();
-  if (connected != lastConnected) {
-    lastConnected = connected;
-    showStatus(connected ? "Connected" : "Disconnected",
-               connected ? "Open Chronos app" : "Pair again");
-  }
-
-  if (!connected) {
-    clearAndBase();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("Not connected.");
-    display.println("Pair in Chronos.");
-    display.println("Device: ESP32-NAV");
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.print("Status: ");
+    display.println(state ? "Connected" : "Disconnected");
     display.display();
-    delay(200);
-    return;
-  }
+}
 
-  // ===== NOTIF MODE =====
-  int nCount = chronos.getNotificationCount();
-  if (!showingNotif && nCount > 0) {
-    Notification notif = chronos.getNotificationAt(nCount - 1);
-    if (notifLooksValid(notif)) {
-      lastNotif = notif;
-      showingNotif = true;
-      notifShownAt = millis();
-      chronos.clearNotifications(); // biar gak spam notif yang sama
+void notificationCallback(Notification notification)
+{/*
+    Serial.print("Notification received at ");
+    Serial.println(notification.time);
+    Serial.print("From: ");
+    Serial.print(notification.app);
+    Serial.print("\tIcon: ");
+    Serial.println(notification.icon);
+    Serial.println(notification.title);
+    Serial.println(notification.message);)
+
+    // Hiển thị thông báo lên OLED (có thể cần cuộn hoặc hiển thị từng phần)
+    display.clearDisplay();
+    display.setTextSize(1); // Kích thước chữ nhỏ
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.println("NEW NOTIF:");
+    display.println("-----------");
+    display.print(notification.app);
+    display.print(": ");
+    // Giới hạn độ dài nội dung để không tràn màn hình
+    if (notification.title.length() > 20) { // Giới hạn 20 ký tự
+        display.println(notification.title.substring(0, 17) + "...");
+    } else {
+        display.println(notification.title);
     }
-  }
+    if (notification.message.length() > 40) { // Giới hạn 40 ký tự
+         display.println(notification.message.substring(0, 37) + "...");
+    } else {
+        display.println(notification.message);
+    }
+    display.display();*/
+}
 
-  if (showingNotif) {
-    drawNotifScreen();
-    if (millis() - notifShownAt > NOTIF_SHOW_MS) showingNotif = false;
-    delay(120);
-    return;
-  }
+// Hàm mới để cập nhật hiển thị OLED (bao gồm icon và văn bản)
+void updateNavigationDisplay() {
+    // Chỉ hiển thị nếu navigation đang hoạt động
+    if (!isNavigationActive) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0,0);
+        display.println("Navigation Inactive");
+        display.display();
+        return;
+    }
 
-  // ===== NAV MODE =====
-  Navigation nav = chronos.getNavigation();
+    // Xóa toàn bộ màn hình hoặc chỉ vùng văn bản nếu bạn muốn icon luôn hiện
+    // Mình sẽ vẽ lại cả icon và văn bản để đảm bảo mọi thứ đồng bộ
+    display.clearDisplay();
 
-  // nav.active = navigasi jalan
-  // nav.isNavigation = kadang dipakai untuk general nav info
-  if (nav.active || nav.isNavigation) {
-    drawNavScreen(nav);
-    delay(120);
-    return;
-  }
+    // VẼ ICON ĐIỀU HƯỚNG
+    // Vẽ icon ở góc trên bên trái (0,0) nếu có dữ liệu icon hợp lệ
+    if (nav_crc != 0xFFFFFFFF) { // nav_crc = 0xFFFFFFFF nghĩa là chưa có icon nào được gửi
+        display.drawBitmap(0, 0, currentNavData.icon, 48, 48, SSD1306_WHITE);
+    } else {
+        // Nếu không có icon, bạn có thể để trống hoặc vẽ một hình nền đen ở đó
+        display.fillRect(0, 0, 48, 48, SSD1306_BLACK);
+    }
 
-  // ===== IDLE MODE =====
-  drawIdleScreen();
-  delay(250);
+
+    // THIẾT LẬP VỊ TRÍ VÀ THÔNG SỐ VĂN BẢN
+    display.setTextSize(1); // Bạn đang dùng 1
+    display.setTextColor(SSD1306_WHITE);
+
+    int text_start_x = 55;   // Bắt đầu văn bản từ cột 55 (bên phải icon 48px + khoảng trống)
+    // Với setTextSize(1.5), chiều cao ký tự khoảng 12 pixel (8*1.5).
+    // Dòng 16 pixel có vẻ phù hợp cho setTextSize(1.5) như bạn đã dùng.
+    int line_height = 16;
+
+
+    // CÁC DÒNG HIỂN THỊ THÔNG TIN VĂN BẢN
+    display.setCursor(text_start_x, 0 * line_height);
+    display.print("Dist: ");
+    display.println(currentNavData.distance);
+
+    display.setCursor(text_start_x, 1 * line_height);
+    display.println("Title: ");
+
+    display.setTextSize(2);
+    display.setCursor(text_start_x, 2 * line_height);
+    display.println(currentNavData.title); // Đây là khoảng cách rẽ kế tiếp
+
+    // Nếu bạn muốn hiển thị các thông tin khác từ nav object, hãy thêm vào đây
+    // Ví dụ:
+    // display.setCursor(text_start_x, 2 * line_height);
+    // display.print("Dir: "); display.println(currentNavData.directions);
+    // display.setCursor(text_start_x, 3 * line_height);
+    // display.print("ETA: "); display.println(currentNavData.eta);
+
+
+    display.display(); // Đẩy tất cả dữ liệu ra màn hình
+}
+
+void configCallback(Config config, uint32_t a, uint32_t b)
+{
+    switch (config)
+    {
+    case CF_NAV_DATA:
+       // Serial.print("Navigation state: ");
+       // Serial.println(a ? "Active" : "Inactive");
+        isNavigationActive = a; // Cập nhật trạng thái dẫn đường toàn cục
+
+        if (isNavigationActive) // Nếu navigation active
+        {
+            currentNavData = watch.getNavigation(); // Lưu dữ liệu navigation vào biến toàn cục
+            //Serial.println(currentNavData.directions);
+            //Serial.println(currentNavData.eta);
+            //Serial.println(currentNavData.duration);
+           // Serial.println(currentNavData.distance);
+           // Serial.println(currentNavData.title);
+            //Serial.println(currentNavData.speed);
+            // In thêm next_step_distance nếu thư viện của bạn có
+            // Serial.println(currentNavData.next_step_distance);
+
+            change = true; // Đặt cờ để biết cần cập nhật hiển thị OLED
+        } else { // Nếu navigation không active
+            change = true; // Đặt cờ để gọi updateNavigationDisplay() để hiển thị "Inactive"
+        }
+        break;
+
+    case CF_NAV_ICON:
+        //Serial.print("Navigation Icon data, position: ");
+        //Serial.println(a);
+        //Serial.print("Icon CRC: ");
+        //Serial.printf("0x%04X\n", b);
+        if (a == 2){ // Khi icon đã được truyền đầy đủ
+            Navigation tempNav = watch.getNavigation(); // Lấy dữ liệu icon
+            if (nav_crc != tempNav.iconCRC) // Chỉ cập nhật nếu CRC thay đổi
+            {
+                nav_crc = tempNav.iconCRC;
+                currentNavData = tempNav; // Lưu dữ liệu icon vào biến toàn cục
+                change = true; // Đặt cờ để cập nhật hiển thị OLED
+            }
+        }
+        break;
+    }
+}
+
+void setup()
+{
+    //Serial.begin(115200);
+
+    // KHỞI TẠO MÀN HÌNH OLED
+    // Bắt đầu giao tiếp I2C cho OLED
+    Wire.begin(); // ESP32 mặc định dùng GPIO21 (SDA) và GPIO22 (SCL)
+
+    // Thử khởi tạo OLED với địa chỉ 0x3C
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        //Serial.println(F("SSD1306 allocation failed (0x3C)"));
+        // Thử với địa chỉ 0x3D nếu 0x3C không được
+        if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+            //Serial.println(F("SSD1306 allocation failed (0x3D)"));
+            for(;;); // Đừng làm gì nếu không thể khởi tạo OLED
+        } else {
+            //Serial.println(F("SSD1306 initialized (0x3D)"));
+        }
+    } else {
+        //Serial.println(F("SSD1306 initialized (0x3C)"));
+    }
+
+    // Cài đặt hiển thị ban đầu
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.println("Chronos Nav Ready!");
+    display.display();
+    delay(2000); // Hiển thị trong 2 giây
+
+    // set the callbacks before calling begin funtion
+    watch.setConnectionCallback(connectionCallback);
+    watch.setNotificationCallback(notificationCallback);
+    watch.setConfigurationCallback(configCallback);
+
+    watch.begin(); // initializes the BLE
+    //Serial.println(watch.getAddress()); // mac address, call after begin()
+
+    watch.setBattery(80); // set the battery level, will be synced to the app
+}
+
+void loop()
+{
+    watch.loop(); // handles internal routine functions
+
+    // Kiểm tra cờ 'change' để cập nhật màn hình OLED
+    if (change) {
+        updateNavigationDisplay(); // Gọi hàm cập nhật hiển thị
+        change = false; // Reset cờ để chỉ cập nhật khi có thay đổi mới
+    }
+
 }
