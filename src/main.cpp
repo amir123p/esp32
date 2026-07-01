@@ -1,235 +1,281 @@
-#include <Wire.h> // Bắt buộc phải có để sử dụng I2C
-#include <Adafruit_GFX.h> // Thư viện đồ họa Adafruit
-#include <Adafruit_SSD1306.h> // Thư viện cho màn hình SSD1306 OLED
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <ChronosESP32.h>
+#include "anim.h"
 
-// Khai báo màn hình OLED
-// Kích thước màn hình (pixels)
+
+// ===== PROTOTYPE (biar compiler gak nangis) =====
+void updateNavigationDisplay();
+void connectionCallback(bool state);
+void notificationCallback(Notification notification);
+void configCallback(Config config, uint32_t a, uint32_t b);
+
+// =====================================================
+// ===== GLOBAL ========================================
+// =====================================================
+
+// ===== OLED =====
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-
-// Địa chỉ I2C của màn hình OLED, THAY ĐỔI NẾU CỦA BẠN KHÁC (0x3C hoặc 0x3D)
-#define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-
+#define OLED_RESET -1
 #define OLED_SDA_PIN 21
 #define OLED_SCL_PIN 22
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-ChronosESP32 watch("ESP_NJG"); // set the bluetooth name
+// ===== Chronos =====
+ChronosESP32 watch("ESP_gw");
 
+// ===== Button =====
+#define BUTTON_PIN 23
+#define BUTTON_ACTIVE_LOW true
+
+// ===== Navigation State =====
 bool change = false;
 uint32_t nav_crc = 0xFFFFFFFF;
-
-// Thêm biến toàn cục để lưu trữ dữ liệu navigation và trạng thái
 Navigation currentNavData;
-bool isNavigationActive = false; // Biến theo dõi trạng thái dẫn đường
+bool isNavigationActive = false;
+
+// ===== Idle Mode =====
+enum IdleMode : uint8_t { IDLE_CLOCK = 0, IDLE_ANIM = 1 };
+IdleMode idleMode = IDLE_CLOCK;
+
+// ===== Timing =====
+static unsigned long lastClockDraw = 0;
+static unsigned long lastAnimDraw  = 0;
+static uint8_t animIndex = 0;
+
+// ===== Button Debounce =====
+static unsigned long lastBtnChange = 0;
+static bool lastBtnState = HIGH;
+
+// ===== Notification Overlay =====
+volatile bool notifActive = false;
+static unsigned long notifUntil = 0;
+static String notifApp, notifTitle, notifMsg;
+static int notifScrollY = 0;
+static unsigned long lastNotifScroll = 0;
+
+#define NOTIF_SHOW_MS 6000
+#define NOTIF_SCROLL_MS 180
 
 
-void connectionCallback(bool state)
-{
-    //Serial.print("Connection state: ");
-    //Serial.println(state ? "Connected" : "Disconnected");
 
-    // Cập nhật trạng thái kết nối lên OLED
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
-    display.print("Status: ");
-    display.println(state ? "Connected" : "Disconnected");
-    display.display();
+// =====================================================
+// ===== HELPER FUNCTIONS ==============================
+// =====================================================
+
+static void drawCenteredText(const String &text, int textSize, int y) {
+  display.setTextSize(textSize);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  int x = (SCREEN_WIDTH - (int)w) / 2;
+  display.setCursor(x < 0 ? 0 : x, y);
+  display.print(text);
 }
 
-void notificationCallback(Notification notification)
-{/*
-    Serial.print("Notification received at ");
-    Serial.println(notification.time);
-    Serial.print("From: ");
-    Serial.print(notification.app);
-    Serial.print("\tIcon: ");
-    Serial.println(notification.icon);
-    Serial.println(notification.title);
-    Serial.println(notification.message);)
+static void drawWrappedText(const String &text, int x, int y, int maxW, int lineH, int maxLines) {
+  String line = "";
+  int lines = 0;
 
-    // Hiển thị thông báo lên OLED (có thể cần cuộn hoặc hiển thị từng phần)
-    display.clearDisplay();
-    display.setTextSize(1); // Kích thước chữ nhỏ
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
-    display.println("NEW NOTIF:");
-    display.println("-----------");
-    display.print(notification.app);
-    display.print(": ");
-    // Giới hạn độ dài nội dung để không tràn màn hình
-    if (notification.title.length() > 20) { // Giới hạn 20 ký tự
-        display.println(notification.title.substring(0, 17) + "...");
+  for (int i = 0; i < (int)text.length();) {
+    while (i < (int)text.length() && text[i] == ' ') i++;
+    int j = i;
+    while (j < (int)text.length() && text[j] != ' ') j++;
+    String word = text.substring(i, j);
+    i = j;
+
+    if (!word.length()) continue;
+
+    String test = line.length() ? (line + " " + word) : word;
+
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(test, x, y + lines * lineH, &x1, &y1, &w, &h);
+
+    if ((int)w > maxW && line.length()) {
+      display.setCursor(x, y + lines * lineH);
+      display.print(line);
+      lines++;
+      if (lines >= maxLines) return;
+      line = word;
     } else {
-        display.println(notification.title);
+      line = test;
     }
-    if (notification.message.length() > 40) { // Giới hạn 40 ký tự
-         display.println(notification.message.substring(0, 37) + "...");
-    } else {
-        display.println(notification.message);
-    }
-    display.display();*/
+  }
+
+  if (line.length() && lines < maxLines) {
+    display.setCursor(x, y + lines * lineH);
+    display.print(line);
+  }
 }
 
-// Hàm mới để cập nhật hiển thị OLED (bao gồm icon và văn bản)
-void updateNavigationDisplay() {
-    // Chỉ hiển thị nếu navigation đang hoạt động
-    if (!isNavigationActive) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(0,0);
-        display.println("Navigation Inactive");
-        display.display();
-        return;
-    }
+static void drawNotificationOverlay() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
 
-    // Xóa toàn bộ màn hình hoặc chỉ vùng văn bản nếu bạn muốn icon luôn hiện
-    // Mình sẽ vẽ lại cả icon và văn bản để đảm bảo mọi thứ đồng bộ
-    display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("NOTIF: ");
+  display.print(notifApp);
 
-    // VẼ ICON ĐIỀU HƯỚNG
-    // Vẽ icon ở góc trên bên trái (0,0) nếu có dữ liệu icon hợp lệ
-    if (nav_crc != 0xFFFFFFFF) { // nav_crc = 0xFFFFFFFF nghĩa là chưa có icon nào được gửi
-        display.drawBitmap(0, 0, currentNavData.icon, 48, 48, SSD1306_WHITE);
-    } else {
-        // Nếu không có icon, bạn có thể để trống hoặc vẽ một hình nền đen ở đó
-        display.fillRect(0, 0, 48, 48, SSD1306_BLACK);
-    }
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
+  drawWrappedText(notifTitle, 0, 12, 128, 10, 2);
 
-    // THIẾT LẬP VỊ TRÍ VÀ THÔNG SỐ VĂN BẢN
-    display.setTextSize(1); // Bạn đang dùng 1
-    display.setTextColor(SSD1306_WHITE);
+  int msgY = 34 - notifScrollY;
+  drawWrappedText(notifMsg, 0, msgY, 128, 10, 30);
 
-    int text_start_x = 55;   // Bắt đầu văn bản từ cột 55 (bên phải icon 48px + khoảng trống)
-    // Với setTextSize(1.5), chiều cao ký tự khoảng 12 pixel (8*1.5).
-    // Dòng 16 pixel có vẻ phù hợp cho setTextSize(1.5) như bạn đã dùng.
-    int line_height = 16;
-
-
-    // CÁC DÒNG HIỂN THỊ THÔNG TIN VĂN BẢN
-    display.setCursor(text_start_x, 0 * line_height);
-    display.print("Dist: ");
-    display.println(currentNavData.distance);
-
-    display.setCursor(text_start_x, 1 * line_height);
-    display.println("Title: ");
-
-    display.setTextSize(2);
-    display.setCursor(text_start_x, 2 * line_height);
-    display.println(currentNavData.title); // Đây là khoảng cách rẽ kế tiếp
-
-    // Nếu bạn muốn hiển thị các thông tin khác từ nav object, hãy thêm vào đây
-    // Ví dụ:
-    // display.setCursor(text_start_x, 2 * line_height);
-    // display.print("Dir: "); display.println(currentNavData.directions);
-    // display.setCursor(text_start_x, 3 * line_height);
-    // display.print("ETA: "); display.println(currentNavData.eta);
-
-
-    display.display(); // Đẩy tất cả dữ liệu ra màn hình
+  display.display();
 }
 
-void configCallback(Config config, uint32_t a, uint32_t b)
-{
-    switch (config)
-    {
-    case CF_NAV_DATA:
-       // Serial.print("Navigation state: ");
-       // Serial.println(a ? "Active" : "Inactive");
-        isNavigationActive = a; // Cập nhật trạng thái dẫn đường toàn cục
+static void drawBigClock() {
+  int hh = watch.getHourC();
+  int mm = watch.getMinute();
 
-        if (isNavigationActive) // Nếu navigation active
-        {
-            currentNavData = watch.getNavigation(); // Lưu dữ liệu navigation vào biến toàn cục
-            //Serial.println(currentNavData.directions);
-            //Serial.println(currentNavData.eta);
-            //Serial.println(currentNavData.duration);
-           // Serial.println(currentNavData.distance);
-           // Serial.println(currentNavData.title);
-            //Serial.println(currentNavData.speed);
-            // In thêm next_step_distance nếu thư viện của bạn có
-            // Serial.println(currentNavData.next_step_distance);
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", hh, mm);
 
-            change = true; // Đặt cờ để biết cần cập nhật hiển thị OLED
-        } else { // Nếu navigation không active
-            change = true; // Đặt cờ để gọi updateNavigationDisplay() để hiển thị "Inactive"
-        }
-        break;
-
-    case CF_NAV_ICON:
-        //Serial.print("Navigation Icon data, position: ");
-        //Serial.println(a);
-        //Serial.print("Icon CRC: ");
-        //Serial.printf("0x%04X\n", b);
-        if (a == 2){ // Khi icon đã được truyền đầy đủ
-            Navigation tempNav = watch.getNavigation(); // Lấy dữ liệu icon
-            if (nav_crc != tempNav.iconCRC) // Chỉ cập nhật nếu CRC thay đổi
-            {
-                nav_crc = tempNav.iconCRC;
-                currentNavData = tempNav; // Lưu dữ liệu icon vào biến toàn cục
-                change = true; // Đặt cờ để cập nhật hiển thị OLED
-            }
-        }
-        break;
-    }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(String(buf), 3, 18);
+  display.display();
 }
 
-void setup()
-{
-    //Serial.begin(115200);
+static void drawAnimFrame(uint8_t idx) {
+  if (ANIM_FRAME_COUNT == 0) return;
+  if (idx >= ANIM_FRAME_COUNT) idx = 0;
 
-    // KHỞI TẠO MÀN HÌNH OLED
-    // Bắt đầu giao tiếp I2C cho OLED
-    Wire.begin(); // ESP32 mặc định dùng GPIO21 (SDA) và GPIO22 (SCL)
+  const uint8_t* frame = (const uint8_t*)pgm_read_ptr(&ANIM_FRAMES[idx]);
 
-    // Thử khởi tạo OLED với địa chỉ 0x3C
-    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        //Serial.println(F("SSD1306 allocation failed (0x3C)"));
-        // Thử với địa chỉ 0x3D nếu 0x3C không được
-        if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
-            //Serial.println(F("SSD1306 allocation failed (0x3D)"));
-            for(;;); // Đừng làm gì nếu không thể khởi tạo OLED
-        } else {
-            //Serial.println(F("SSD1306 initialized (0x3D)"));
-        }
-    } else {
-        //Serial.println(F("SSD1306 initialized (0x3C)"));
-    }
-
-    // Cài đặt hiển thị ban đầu
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
-    display.println("Chronos Nav Ready!");
-    display.display();
-    delay(2000); // Hiển thị trong 2 giây
-
-    // set the callbacks before calling begin funtion
-    watch.setConnectionCallback(connectionCallback);
-    watch.setNotificationCallback(notificationCallback);
-    watch.setConfigurationCallback(configCallback);
-
-    watch.begin(); // initializes the BLE
-    //Serial.println(watch.getAddress()); // mac address, call after begin()
-
-    watch.setBattery(80); // set the battery level, will be synced to the app
+  display.clearDisplay();
+  display.drawBitmap(0, 0, frame, 128, 64, SSD1306_WHITE);
+  display.display();
 }
 
-void loop()
-{
-    watch.loop(); // handles internal routine functions
+static void drawIdle() {
+  if (idleMode == IDLE_CLOCK) {
+    if (millis() - lastClockDraw >= 400) {
+      lastClockDraw = millis();
+      drawBigClock();
+    }
+  } else {
+    if (millis() - lastAnimDraw >= 90) {
+      lastAnimDraw = millis();
+      drawAnimFrame(animIndex++);
+      if (animIndex >= ANIM_FRAME_COUNT) animIndex = 0;
+    }
+  }
+}
 
-    // Kiểm tra cờ 'change' để cập nhật màn hình OLED
-    if (change) {
-        updateNavigationDisplay(); // Gọi hàm cập nhật hiển thị
-        change = false; // Reset cờ để chỉ cập nhật khi có thay đổi mới
+static void handleButton() {
+  bool raw = digitalRead(BUTTON_PIN);
+  bool pressed = BUTTON_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+
+  if (millis() - lastBtnChange < 30) return;
+
+  if (raw != lastBtnState) {
+    lastBtnChange = millis();
+    lastBtnState = raw;
+
+    if (pressed) {
+      idleMode = (idleMode == IDLE_CLOCK) ? IDLE_ANIM : IDLE_CLOCK;
+      animIndex = 0;
+      change = true;
+    }
+  }
+}
+
+
+
+// =====================================================
+// ===== CALLBACK ======================================
+// =====================================================
+
+void connectionCallback(bool state) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Status: ");
+  display.println(state ? "Connected" : "Disconnected");
+  display.display();
+}
+
+void notificationCallback(Notification notification) {
+  notifApp = notification.app;
+  notifTitle = notification.title;
+  notifMsg = notification.message;
+
+  notifActive = true;
+  notifUntil = millis() + NOTIF_SHOW_MS;
+  notifScrollY = 0;
+  lastNotifScroll = 0;
+}
+
+
+
+// =====================================================
+// ===== SETUP =========================================
+// =====================================================
+
+void setup() {
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      for (;;) {}
+    }
+  }
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  watch.setConnectionCallback(connectionCallback);
+  watch.setNotificationCallback(notificationCallback);
+  watch.begin();
+  watch.setBattery(80);
+
+  change = true;
+}
+
+
+
+// =====================================================
+// ===== LOOP (YANG SUDAH DIOPTIMASI) ==================
+// =====================================================
+
+void loop() {
+  watch.loop();
+  handleButton();
+
+  // ===== NOTIFICATION PRIORITY =====
+  if (notifActive) {
+
+    if (millis() - lastNotifScroll > NOTIF_SCROLL_MS) {
+      lastNotifScroll = millis();
+      notifScrollY += 2;
+      if (notifScrollY > 80) notifScrollY = 0;
     }
 
+    drawNotificationOverlay();
+
+    if ((long)(millis() - notifUntil) > 0) {
+      notifActive = false;
+      change = true;
+    }
+
+    delay(30);  // ← TAMBAHAN: jeda 30ms
+    return;
+  }
+
+  // ===== NAV OR IDLE =====
+  if (isNavigationActive) {
+    currentNavData = watch.getNavigation();
+    updateNavigationDisplay();
+    delay(30);  // ← TAMBAHAN: jeda 30ms
+    return;
+  }
+
+  drawIdle();
+  delay(30);  // ← TAMBAHAN: jeda 30ms
 }
