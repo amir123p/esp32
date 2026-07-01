@@ -213,6 +213,72 @@ void notificationCallback(Notification notification) {
   lastNotifScroll = 0;
 }
 
+void configCallback(Config config, uint32_t a, uint32_t b) {
+  // ===== IMPLEMENTASI CONFIG CALLBACK =====
+  // Fungsi ini dipanggil saat ada perubahan konfigurasi dari HP
+  // Untuk sekarang, tampilkan pesan di serial
+  
+  Serial.println("=== Config Callback Called ===");
+  Serial.print("Config: ");
+  Serial.println(config.toString().c_str());
+  Serial.print("a: ");
+  Serial.println(a);
+  Serial.print("b: ");
+  Serial.println(b);
+  
+  // Tampilkan di layar (opsional)
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Config Updated!");
+  display.display();
+  delay(2000);
+}
+
+
+
+// =====================================================
+// ===== UPDATE NAVIGATION DISPLAY ====================
+// =====================================================
+
+void updateNavigationDisplay() {
+  // ===== IMPLEMENTASI NAVIGASI =====
+  if (!isNavigationActive) return;
+  
+  currentNavData = watch.getNavigation();
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  
+  // Status koneksi
+  display.setCursor(0, 0);
+  display.print("Nav: ");
+  display.println(currentNavData.isValid ? "Active" : "Waiting");
+  
+  // Koordinat
+  display.setCursor(0, 12);
+  display.print("Lat: ");
+  display.println(currentNavData.latitude, 6);
+  
+  display.setCursor(0, 24);
+  display.print("Lon: ");
+  display.println(currentNavData.longitude, 6);
+  
+  // Kecepatan & Arah (jika ada)
+  display.setCursor(0, 36);
+  display.print("Speed: ");
+  display.print(currentNavData.speed, 1);
+  display.println(" km/h");
+  
+  display.setCursor(0, 48);
+  display.print("Heading: ");
+  display.print(currentNavData.heading, 1);
+  display.println(" deg");
+  
+  display.display();
+}
+
 
 
 // =====================================================
@@ -220,10 +286,13 @@ void notificationCallback(Notification notification) {
 // =====================================================
 
 void setup() {
+  Serial.begin(115200);
+  
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println("OLED not found!");
       for (;;) {}
     }
   }
@@ -232,16 +301,25 @@ void setup() {
 
   watch.setConnectionCallback(connectionCallback);
   watch.setNotificationCallback(notificationCallback);
+  watch.setConfigCallback(configCallback);  // ← Tambahkan ini!
   watch.begin();
   watch.setBattery(80);
 
   change = true;
+  
+  Serial.println("ESP32 Chronos Started!");
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("System Ready!");
+  display.display();
+  delay(1000);
 }
 
 
 
 // =====================================================
-// ===== LOOP (YANG SUDAH DIOPTIMASI) ==================
+// ===== LOOP ==========================================
 // =====================================================
 
 void loop() {
@@ -264,7 +342,7 @@ void loop() {
       change = true;
     }
 
-    delay(30);  // ← TAMBAHAN: jeda 30ms
+    delay(30);
     return;
   }
 
@@ -272,10 +350,10 @@ void loop() {
   if (isNavigationActive) {
     currentNavData = watch.getNavigation();
     updateNavigationDisplay();
-    delay(30);  // ← TAMBAHAN: jeda 30ms
+    delay(30);
     return;
   }
 
   drawIdle();
-  delay(30);  // ← TAMBAHAN: jeda 30ms
+  delay(30);
 }
